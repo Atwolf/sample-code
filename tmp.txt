@@ -1,0 +1,36 @@
+import json
+from pathlib import Path
+
+# Load one of your JSON files
+with open('path_to_your_config.json', 'r') as f:
+    data = json.load(f)
+
+# Check the structure
+print("Top-level keys:", data.keys())
+print("\nBody keys:", data.get('body', {}).keys())
+
+# Check if gslbServices exists and how many
+gslb = data.get('body', {}).get('gslbServices', [])
+print(f"\ngslbServices count: {len(gslb)}")
+
+# If gslbServices exists, check the first one
+if gslb:
+    print("\nFirst GslbService keys:", gslb[0].keys())
+    print("Name:", gslb[0].get('name'))
+    print("Tenant ref:", gslb[0].get('tenant_ref'))
+    print("UUID:", gslb[0].get('uuid'))
+
+
+import duckdb
+
+con = duckdb.connect('avi_config.duckdb')
+
+# Check what was actually inserted
+print("\nConfigs in DB:")
+print(con.execute("SELECT * FROM config_metadata").fetchall())
+
+print("\nTotal services:")
+print(con.execute("SELECT COUNT(*) FROM services").fetchone())
+
+print("\nService types in DB:")
+print(con.execute("SELECT service_type, COUNT(*) FROM services GROUP BY service_type").fetchall())
