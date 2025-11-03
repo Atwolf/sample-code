@@ -1,0 +1,298 @@
+import duckdb
+import json
+from pathlib import Path
+from datetime import datetime
+import re
+
+class AviConfigDB:
+    def __init__(self, db_path='avi_config.duckdb'):
+        """Initialize connection to DuckDB database"""
+        self.con = duckdb.connect(db_path)
+        self._create_schema()
+   
+    def _create_schema(self):
+        """Create database schema"""
+        self.con.execute("""
+            CREATE TABLE IF NOT EXISTS config_metadata (
+                config_id INTEGER PRIMARY KEY,
+                dc TEXT NOT NULL,
+                timestamp TIMESTAMP NOT NULL,
+                filename TEXT NOT NULL,
+                loaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(dc)
+            )
+        """)
+       
+        self.con.execute("""
+            CREATE TABLE IF NOT EXISTS gslb_services (
+                name TEXT PRIMARY KEY,
+                tenant_ref TEXT NOT NULL,
+                uuid TEXT UNIQUE NOT NULL,
+                service_json JSON NOT NULL
+            )
+        """)
+       
+        self.con.execute("""
+            CREATE INDEX IF NOT EXISTS idx_gslb_tenant
+            ON gslb_services(tenant_ref)
+        """)
+       
+        self.con.execute("""
+            CREATE TABLE IF NOT EXISTS services (
+                service_id INTEGER PRIMARY KEY,
+                config_id INTEGER NOT NULL,
+                dc TEXT NOT NULL,
+                service_type TEXT NOT NULL,
+                name TEXT NOT NULL,
+                tenant_ref TEXT NOT NULL,
+                uuid TEXT UNIQUE NOT NULL,
+                service_json JSON NOT NULL,
+                FOREIGN KEY (config_id) REFERENCES config_metadata(config_id) ON DELETE CASCADE
+            )
+        """)
+       
+        self.con.execute("""
+            CREATE INDEX IF NOT EXISTS idx_services_tenant
+            ON services(tenant_ref, service_type)
+        """)
+       
+        self.con.execute("""
+            CREATE INDEX IF NOT EXISTS idx_services_tenant_dc
+            ON services(tenant_ref, dc)
+        """)
+   
+    def _parse_filename(self, filename):
+        """
+        Parse filename to extract DC and timestamp
+        Example: apple-avi-controller-agcp1-pgen-fa.snapple.net_10-28-2025-07-06-16.json
+        Returns: (dc, timestamp)
+        """
+        pattern = r'dc([a-z]+)-avi-controller.*_(\d{2}-\d{2}-\d{4}-\d{2}-\d{2}-\d{2})\.json'
+        match = re.search(pattern, filename)
+       
+        if not match:
+            raise ValueError(f"Filename doesn't match expected pattern: {filename}")
+       
+        dc = match.group(1)
+        timestamp_str = match.group(2)
+       
+        # Parse timestamp: MM-DD-YYYY-HH-MM-SS
+        timestamp = datetime.strptime(timestamp_str, '%m-%d-%Y-%H-%M-%S')
+       
+        return dc, timestamp
+   
+    def should_ingest(self, dc, timestamp):
+        """Check if this config is newer than existing one for this DC"""
+        result = self.con.execute("""
+            SELECT timestamp FROM config_metadata WHERE dc = ?
+        """, [dc]).fetchone()
+       
+        if result is None:
+            return True
+       
+        existing_timestamp = result[0]
+        return timestamp > existing_timestamp
+   
+    def ingest_config(self, json_path):
+        """
+        Ingest a JSON config file into the database
+        Returns: (success, message)
+        """
+        json_path = Path(json_path)
+        filename = json_path.name
+       
+        try:
+            # Parse filename
+            dc, timestamp = self._parse_filename(filename)
+           
+            # Check if we should ingest
+            if not self.should_ingest(dc, timestamp):
+                return False, f"Skipping {filename}: older than existing config for dc{dc}"
+           
+            # Load JSON
+            with open(json_path, 'r') as f:
+                data = json.load(f)
+           
+            body = data.get('body', {})
+           
+            # Start transaction
+            self.con.begin()
+           
+            try:
+                # Delete old config for this DC (CASCADE will delete services)
+                self.con.execute("DELETE FROM config_metadata WHERE dc = ?", [dc])
+               
+                # Insert new config metadata
+                config_id = self.con.execute("""
+                    INSERT INTO config_metadata (dc, timestamp, filename)
+                    VALUES (?, ?, ?)
+                    RETURNING config_id
+                """, [dc, timestamp, filename]).fetchone()[0]
+               
+                # Ingest GslbServices
+                gslb_services = body.get('gslbServices', [])
+                for service in gslb_services:
+                    self.con.execute("""
+                        INSERT INTO gslb_services (name, tenant_ref, uuid, service_json)
+                        VALUES (?, ?, ?, ?)
+                        ON CONFLICT (uuid) DO NOTHING
+                    """, [
+                        service.get('name'),
+                        service.get('tenant_ref'),
+                        service.get('uuid'),
+                        json.dumps(service)
+                    ])
+               
+                # Ingest other service types
+                service_types = [
+                    'Pool', 'PoolGroup', 'VirtualService', 'VsVip',
+                    'SCPoolServiceStateInfo', 'HealthMonitor', 'DebugVirtualService'
+                ]
+               
+                total_services = 0
+                for service_type in service_types:
+                    services = body.get(service_type, [])
+                    for service in services:
+                        self.con.execute("""
+                            INSERT INTO services (
+                                config_id, dc, service_type, name,
+                                tenant_ref, uuid, service_json
+                            )
+                            VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """, [
+                            config_id,
+                            dc,
+                            service_type,
+                            service.get('name'),
+                            service.get('tenant_ref'),
+                            service.get('uuid'),
+                            json.dumps(service)
+                        ])
+                        total_services += 1
+               
+                self.con.commit()
+               
+                return True, f"Ingested {filename}: {len(gslb_services)} GslbServices, {total_services} other services"
+           
+            except Exception as e:
+                self.con.rollback()
+                raise
+       
+        except Exception as e:
+            return False, f"Error ingesting {filename}: {str(e)}"
+   
+    def query_by_fqdn(self, fqdn):
+        """
+        Query all services related to a GslbService FQDN
+        Returns: list of dicts with keys: service_type, dc, service_json
+        """
+        query = """
+        WITH tenant AS (
+            SELECT tenant_ref FROM gslb_services WHERE name = ?
+        )
+        SELECT
+            'GslbService' as service_type,
+            NULL as dc,
+            service_json
+        FROM gslb_services
+        WHERE name = ?
+       
+        UNION ALL
+       
+        SELECT
+            service_type,
+            dc,
+            service_json
+        FROM services
+        WHERE tenant_ref = (SELECT tenant_ref FROM tenant)
+        ORDER BY dc NULLS FIRST, service_type
+        """
+       
+        results = self.con.execute(query, [fqdn, fqdn]).fetchall()
+       
+        return [
+            {
+                'service_type': row[0],
+                'dc': row[1],
+                'service_json': json.loads(row[2])
+            }
+            for row in results
+        ]
+   
+    def get_stats(self):
+        """Get database statistics"""
+        stats = {}
+       
+        # Config metadata
+        configs = self.con.execute("SELECT dc, timestamp, filename FROM config_metadata ORDER BY dc").fetchall()
+        stats['configs'] = [{'dc': c[0], 'timestamp': c[1], 'filename': c[2]} for c in configs]
+       
+        # GslbServices count
+        stats['gslb_services_count'] = self.con.execute("SELECT COUNT(*) FROM gslb_services").fetchone()[0]
+       
+        # Services by type
+        service_counts = self.con.execute("""
+            SELECT service_type, dc, COUNT(*) as count
+            FROM services
+            GROUP BY service_type, dc
+            ORDER BY service_type, dc
+        """).fetchall()
+        stats['service_counts'] = [
+            {'service_type': s[0], 'dc': s[1], 'count': s[2]}
+            for s in service_counts
+        ]
+       
+        return stats
+   
+    def close(self):
+        """Close database connection"""
+        self.con.close()
+
+
+# Example usage
+if __name__ == "__main__":
+    # Initialize database
+    db = AviConfigDB('avi_config.duckdb')
+   
+    # Ingest config files
+    config_files = [
+        # Add more files...
+    ]
+   
+    for config_file in config_files:
+        success, message = db.ingest_config(config_file)
+        print(f"{'✓' if success else '✗'} {message}")
+   
+    # Query by FQDN
+    fqdn = "claude.net"
+    results = db.query_by_fqdn(fqdn)
+   
+    print(f"\nFound {len(results)} services for {fqdn}:")
+    for result in results:
+        dc_str = f"[{result['dc']}]" if result['dc'] else "[shared]"
+        print(f"  {dc_str} {result['service_type']}")
+   
+    # Get stats
+    stats = db.get_stats()
+    print(f"\nDatabase Stats:")
+    print(f"  GslbServices: {stats['gslb_services_count']}")
+    for config in stats['configs']:
+        print(f"  Config: dc{config['dc']} - {config['filename']}")
+   
+    db.close()
+
+--
+
+# Initialize
+db = AviConfigDB('avi_config.duckdb')
+
+# Ingest all JSON files in a directory
+from pathlib import Path
+for json_file in Path('.').glob('dc*-avi-controller*.json'):
+    success, msg = db.ingest_config(json_file)
+    print(msg)
+
+# Query
+results = db.query_by_fqdn('my-service.snapple.net')
+for r in results:
+    print(f"{r['service_type']} ({r['dc']}): {r['service_json']['name']}")
