@@ -1,0 +1,95 @@
+import json
+import uuid
+from datetime import datetime
+from langchain_text_splitters.html import HTMLSemanticPreservingSplitter
+from typing import List
+
+def confluence_to_chunked_jsonl_optimal(
+    confluence,
+    parent_page_id: str,
+    usecase_id: str,
+    output_file: str = 'confluence_chunked.jsonl',
+    max_chunk_size: int = 1500,
+    chunk_overlap: int = 100
+):
+    """
+    Optimal solution using HTMLSemanticPreservingSplitter.
+    
+    This is NOT hardcoding - we're telling the splitter:
+    "IF you find any h1-h6 headers in the document, use them for semantic boundaries"
+    
+    Each document can have different structures - the splitter adapts automatically.
+    """
+    
+    # This is a GENERIC rulebook, not hardcoding your document structure
+    # The splitter will only use headers that actually exist in each document
+    html_splitter = HTMLSemanticPreservingSplitter(
+        headers_to_split_on=[
+            ("h1", "Header1"),
+            ("h2", "Header2"),
+            ("h3", "Header3"),
+            ("h4", "Header4"),
+            ("h5", "Header5"),
+            ("h6", "Header6"),
+        ],
+        max_chunk_size=max_chunk_size,
+        chunk_overlap=chunk_overlap,
+        # Preserve ALL common structural elements - no hardcoding needed
+        elements_to_preserve=["table", "ul", "ol", "dl", "pre", "code", "blockquote"],
+        preserve_links=True,      # Automatically handles <a> tags
+        preserve_images=True,     # Automatically handles <img> tags
+        preserve_videos=True,     # Automatically handles <video> tags
+        preserve_audio=True,      # Automatically handles <audio> tags
+    )
+    
+    all_children = get_all_children_recursive(confluence, parent_page_id)
+    total_chunks = 0
+    
+    with open(output_file, 'w', encoding='utf-8') as f:
+        for child in all_children:
+            page_id = child['id']
+            
+            # Get full page
+            full_page = confluence.get_page_by_id(
+                page_id,
+                expand='body.view,version,history'
+            )
+            
+            html_content = full_page['body']['view']['value']
+            page_title = full_page.get('title', 'untitled')
+            
+            # Get last modified date
+            version_info = full_page.get('version', {})
+            last_modified = version_info.get('when', datetime.now().isoformat())
+            
+            # Generate unique document_id
+            document_id = str(uuid.uuid4())
+            
+            # The magic happens here - splitter automatically:
+            # 1. Detects which headers exist in THIS specific document
+            # 2. Uses them for semantic boundaries
+            # 3. Preserves tables and lists intact
+            # 4. Converts links to markdown format
+            # 5. Falls back to text splitting for oversized elements
+            documents = html_splitter.split_text(html_content)
+            
+            # Create JSONL entries
+            for idx, doc in enumerate(documents):
+                entry = {
+                    "usecase_id": usecase_id,
+                    "document_id": document_id,
+                    "chunk_id": f"{document_id}_chunk_{idx}",
+                    "raw_context": doc.page_content,
+                    "file_name": f"{page_title}.html",
+                    "data_classification": "Internal",
+                    "sor_last_modified": last_modified
+                }
+                
+                f.write(json.dumps(entry, ensure_ascii=False) + '\n')
+                total_chunks += 1
+    
+    print(f"✓ Created {output_file}")
+    print(f"  - {len(all_children)} pages processed")
+    print(f"  - {total_chunks} total chunks created")
+    
+    return output_file
