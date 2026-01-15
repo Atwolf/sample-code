@@ -1,0 +1,8 @@
+# Create tabs for top 5 confusion pairs
+test_df['confusion_pair'] = test_df['actual_label'] + ' → ' + test_df['predicted_label']
+misclassified = test_df[test_df['predicted_label'] != test_df['actual_label']]
+
+for pair in misclassified['confusion_pair'].value_counts().head(5).index:
+    pair_df = misclassified[misclassified['confusion_pair'] == pair]
+    sheet_name = pair[:31].replace('/', '-').replace('*', '').replace('?', '')
+    pair_df.to_excel(writer, sheet_name=sheet_name, index=False)
