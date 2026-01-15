@@ -1,0 +1,182 @@
+import httpx
+from fastmcp import FastMCP, Context
+from network_mcp.config import settings
+
+loadbalancing_mcp = FastMCP(name="loadbalancing-tools")
+
+DC_MAPPING = {
+    "dcms": "Manassas",
+    "dcda": "Dallas",
+    # ... add others
+}
+
+
+def _get_client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        base_url=settings.lamp_url,
+        headers={"Authorization": f"Bearer {settings.lamp_api_token}"},
+        verify=settings.ssl_cert_path or True,
+        timeout=30.0,
+    )
+
+
+def _get_user_app_ids(ctx: Context) -> list[str]:
+    """Extract entitled app IDs from JWT context."""
+    app_ids = ctx.request_context.get("app_ids") if ctx.request_context else None
+    if not app_ids:
+        raise ValueError("No app entitlements found in token")
+    return app_ids
+
+
+def _validate_app_access(ctx: Context, app_id: str) -> None:
+    """Verify user has access to requested app."""
+    entitled = _get_user_app_ids(ctx)
+    if app_id not in entitled:
+        raise PermissionError(f"No access to app '{app_id}'. Your apps: {entitled}")
+
+
+# ─────────────────────────────────────────────────────────────────
+# Overview tool
+# ─────────────────────────────────────────────────────────────────
+
+@loadbalancing_mcp.tool()
+async def get_app_lb_config(ctx: Context, app_id: str) -> dict:
+    """
+    Get load balancing overview for an app.
+    
+    Returns names of all GSLBs, virtual services, and pools.
+    Use this first to see what's configured, then use detail tools for specifics.
+    
+    Args:
+        app_id: App identifier (e.g., "nbot", "ebssh")
+    """
+    _validate_app_access(ctx, app_id)
+    
+    async with _get_client() as client:
+        gslbs_resp = await client.get("/gslbs", params={"app_id": app_id})
+        vs_resp = await client.get("/virtualservices", params={"app_id": app_id})
+        pools_resp = await client.get("/pools", params={"app_id": app_id})
+        
+        gslbs_resp.raise_for_status()
+        vs_resp.raise_for_status()
+        pools_resp.raise_for_status()
+    
+    return {
+        "app_id": app_id,
+        "gslbs": [g["name"] for g in gslbs_resp.json().get("results", [])],
+        "virtual_services": [vs["name"] for vs in vs_resp.json().get("results", [])],
+        "pools": [p["name"] for p in pools_resp.json().get("results", [])],
+    }
+
+
+# ─────────────────────────────────────────────────────────────────
+# Detail tools
+# ─────────────────────────────────────────────────────────────────
+
+@loadbalancing_mcp.tool()
+async def get_gslb_detail(ctx: Context, app_id: str, gslb_name: str) -> dict:
+    """
+    Get detailed GSLB configuration.
+    
+    Returns FQDNs, member vsvips, and datacenter distribution.
+    
+    Args:
+        app_id: App identifier
+        gslb_name: Name of the GSLB service (from get_app_lb_config)
+    """
+    _validate_app_access(ctx, app_id)
+    
+    async with _get_client() as client:
+        resp = await client.get("/gslbs", params={"app_id": app_id, "name": gslb_name})
+        resp.raise_for_status()
+    
+    results = resp.json().get("results", [])
+    if not results:
+        return {"error": f"GSLB '{gslb_name}' not found"}
+    
+    gslb = results[0]
+    members = []
+    for group in gslb.get("groups", []):
+        for member in group.get("members", []):
+            dc_code = member.get("dc", "unknown")
+            members.append({
+                "fqdn": member.get("fqdn"),
+                "datacenter": DC_MAPPING.get(dc_code, dc_code),
+            })
+    
+    return {
+        "name": gslb["name"],
+        "domain_names": gslb.get("domain_names", []),
+        "members": members,
+    }
+
+
+@loadbalancing_mcp.tool()
+async def get_virtualservice_detail(ctx: Context, app_id: str, vs_name: str) -> dict:
+    """
+    Get detailed virtual service configuration.
+    
+    Returns VIPs, ports, SSL settings, and associated pool.
+    
+    Args:
+        app_id: App identifier
+        vs_name: Name of the virtual service (from get_app_lb_config)
+    """
+    _validate_app_access(ctx, app_id)
+    
+    async with _get_client() as client:
+        resp = await client.get("/virtualservices", params={"app_id": app_id, "name": vs_name})
+        resp.raise_for_status()
+    
+    results = resp.json().get("results", [])
+    if not results:
+        return {"error": f"Virtual service '{vs_name}' not found"}
+    
+    vs = results[0]
+    dc_code = vs.get("dc", "unknown")
+    
+    return {
+        "name": vs["name"],
+        "datacenter": DC_MAPPING.get(dc_code, dc_code),
+        "vip": vs.get("vip"),
+        "port": vs.get("port"),
+        "ssl_enabled": vs.get("ssl_enabled"),
+        "pool": vs.get("pool"),
+    }
+
+
+@loadbalancing_mcp.tool()
+async def get_pool_detail(ctx: Context, app_id: str, pool_name: str) -> dict:
+    """
+    Get detailed pool configuration.
+    
+    Returns pool members, health status, and load balancing algorithm.
+    
+    Args:
+        app_id: App identifier
+        pool_name: Name of the pool (from get_app_lb_config)
+    """
+    _validate_app_access(ctx, app_id)
+    
+    async with _get_client() as client:
+        resp = await client.get("/pools", params={"app_id": app_id, "name": pool_name})
+        resp.raise_for_status()
+    
+    results = resp.json().get("results", [])
+    if not results:
+        return {"error": f"Pool '{pool_name}' not found"}
+    
+    pool = results[0]
+    
+    return {
+        "name": pool["name"],
+        "algorithm": pool.get("lb_algorithm"),
+        "servers": [
+            {
+                "ip": s.get("ip"),
+                "port": s.get("port"),
+                "enabled": s.get("enabled", True),
+            }
+            for s in pool.get("servers", [])
+        ],
+    }
