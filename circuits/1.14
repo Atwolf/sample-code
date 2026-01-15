@@ -57,15 +57,27 @@ def compute_metrics(y_true, y_pred, y_proba, class_names):
     
     y_true_bin = label_binarize(y_true, classes=range(len(class_names)))
     
-    metrics['auc_roc_macro'] = roc_auc_score(y_true_bin, y_proba, average='macro', multi_class='ovr')
-    metrics['auc_roc_per_class'] = {
-        cls: roc_auc_score(y_true_bin[:, i], y_proba[:, i])
-        for i, cls in enumerate(class_names) if y_true_bin[:, i].sum() > 0
-    }
-    metrics['avg_precision_per_class'] = {
-        cls: average_precision_score(y_true_bin[:, i], y_proba[:, i])
-        for i, cls in enumerate(class_names) if y_true_bin[:, i].sum() > 0
-    }
+    # Only compute AUC for classes present in test set
+    present_mask = y_true_bin.sum(axis=0) > 0
+    present_indices = np.where(present_mask)[0]
+    
+    if len(present_indices) > 1:
+        y_true_bin_filtered = y_true_bin[:, present_mask]
+        y_proba_filtered = y_proba[:, present_mask]
+        
+        metrics['auc_roc_macro'] = roc_auc_score(
+            y_true_bin_filtered, y_proba_filtered, average='macro', multi_class='ovr'
+        )
+    else:
+        metrics['auc_roc_macro'] = np.nan
+    
+    metrics['auc_roc_per_class'] = {}
+    metrics['avg_precision_per_class'] = {}
+    
+    for i, cls in enumerate(class_names):
+        if y_true_bin[:, i].sum() > 0:
+            metrics['auc_roc_per_class'][cls] = roc_auc_score(y_true_bin[:, i], y_proba[:, i])
+            metrics['avg_precision_per_class'][cls] = average_precision_score(y_true_bin[:, i], y_proba[:, i])
     
     return metrics
 
