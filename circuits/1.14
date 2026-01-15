@@ -1,0 +1,378 @@
+import pandas as pd
+import numpy as np
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import LabelEncoder, label_binarize
+from sklearn.metrics import (
+    f1_score, precision_recall_curve, roc_auc_score, roc_curve,
+    classification_report, confusion_matrix, average_precision_score
+)
+import matplotlib.pyplot as plt
+from pathlib import Path
+import json
+
+from feature_engineering import engineer_features
+
+
+def load_reports_chronologically(file_paths: list[str]) -> list[pd.DataFrame]:
+    """Load reports maintaining chronological order."""
+    dfs = []
+    for i, path in enumerate(file_paths):
+        df = pd.read_excel(path)
+        df['report_number'] = i + 1
+        df['source_file'] = Path(path).name
+        dfs.append(df)
+    return dfs
+
+
+def prepare_features(df: pd.DataFrame, label_col: str, encoders: dict = None, fit: bool = True):
+    """Prepare features with optional fitting for train vs. test."""
+    df = engineer_features(df)
+    
+    cond_cols = [c for c in df.columns if c.startswith('cond_')]
+    
+    if encoders is None:
+        encoders = {}
+    
+    feature_cols = cond_cols
+    X = df[feature_cols].fillna(0)
+    y = df[label_col]
+    
+    return X, y, feature_cols, encoders
+
+
+def compute_metrics(y_true, y_pred, y_proba, class_names):
+    """Compute all classification metrics."""
+    metrics = {}
+    
+    # F1 scores
+    metrics['f1_macro'] = f1_score(y_true, y_pred, average='macro', zero_division=0)
+    metrics['f1_micro'] = f1_score(y_true, y_pred, average='micro', zero_division=0)
+    metrics['f1_weighted'] = f1_score(y_true, y_pred, average='weighted', zero_division=0)
+    
+    # Per-class F1
+    f1_per_class = f1_score(y_true, y_pred, average=None, zero_division=0)
+    metrics['f1_per_class'] = dict(zip(class_names, f1_per_class))
+    
+    # Classification report as dict
+    metrics['classification_report'] = classification_report(
+        y_true, y_pred, target_names=class_names, output_dict=True, zero_division=0
+    )
+    
+    # AUC-ROC (One-vs-Rest)
+    y_true_bin = label_binarize(y_true, classes=class_names)
+    
+    if len(class_names) == 2:
+        # Binary case
+        metrics['auc_roc_macro'] = roc_auc_score(y_true_bin, y_proba[:, 1])
+        metrics['auc_roc_per_class'] = {'class_1': metrics['auc_roc_macro']}
+    else:
+        # Multiclass case
+        try:
+            metrics['auc_roc_macro'] = roc_auc_score(
+                y_true_bin, y_proba, average='macro', multi_class='ovr'
+            )
+            # Per-class AUC
+            auc_per_class = {}
+            for i, cls in enumerate(class_names):
+                if y_true_bin[:, i].sum() > 0:  # Only if class present in test set
+                    auc_per_class[cls] = roc_auc_score(y_true_bin[:, i], y_proba[:, i])
+                else:
+                    auc_per_class[cls] = np.nan
+            metrics['auc_roc_per_class'] = auc_per_class
+        except ValueError as e:
+            print(f"Warning: Could not compute AUC-ROC: {e}")
+            metrics['auc_roc_macro'] = np.nan
+            metrics['auc_roc_per_class'] = {}
+    
+    # Average precision (area under PR curve) per class
+    ap_per_class = {}
+    for i, cls in enumerate(class_names):
+        if y_true_bin[:, i].sum() > 0:
+            ap_per_class[cls] = average_precision_score(y_true_bin[:, i], y_proba[:, i])
+        else:
+            ap_per_class[cls] = np.nan
+    metrics['avg_precision_per_class'] = ap_per_class
+    
+    return metrics
+
+
+def plot_precision_recall_curves(y_true, y_proba, class_names, output_path: str):
+    """Plot and save precision-recall curves for each class."""
+    y_true_bin = label_binarize(y_true, classes=class_names)
+    
+    n_classes = len(class_names)
+    cols = min(4, n_classes)
+    rows = (n_classes + cols - 1) // cols
+    
+    fig, axes = plt.subplots(rows, cols, figsize=(4 * cols, 4 * rows))
+    axes = np.array(axes).flatten() if n_classes > 1 else [axes]
+    
+    for i, cls in enumerate(class_names):
+        if y_true_bin[:, i].sum() > 0:
+            precision, recall, _ = precision_recall_curve(y_true_bin[:, i], y_proba[:, i])
+            ap = average_precision_score(y_true_bin[:, i], y_proba[:, i])
+            
+            axes[i].plot(recall, precision, lw=2)
+            axes[i].set_xlabel('Recall')
+            axes[i].set_ylabel('Precision')
+            axes[i].set_title(f'{cls}\nAP={ap:.3f}')
+            axes[i].set_xlim([0, 1])
+            axes[i].set_ylim([0, 1.05])
+            axes[i].grid(True, alpha=0.3)
+        else:
+            axes[i].set_title(f'{cls}\n(not in test set)')
+            axes[i].axis('off')
+    
+    # Hide unused subplots
+    for i in range(n_classes, len(axes)):
+        axes[i].axis('off')
+    
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved precision-recall curves to {output_path}")
+
+
+def plot_roc_curves(y_true, y_proba, class_names, output_path: str):
+    """Plot and save ROC curves for each class."""
+    y_true_bin = label_binarize(y_true, classes=class_names)
+    
+    n_classes = len(class_names)
+    cols = min(4, n_classes)
+    rows = (n_classes + cols - 1) // cols
+    
+    fig, axes = plt.subplots(rows, cols, figsize=(4 * cols, 4 * rows))
+    axes = np.array(axes).flatten() if n_classes > 1 else [axes]
+    
+    for i, cls in enumerate(class_names):
+        if y_true_bin[:, i].sum() > 0:
+            fpr, tpr, _ = roc_curve(y_true_bin[:, i], y_proba[:, i])
+            auc = roc_auc_score(y_true_bin[:, i], y_proba[:, i])
+            
+            axes[i].plot(fpr, tpr, lw=2)
+            axes[i].plot([0, 1], [0, 1], 'k--', lw=1)
+            axes[i].set_xlabel('False Positive Rate')
+            axes[i].set_ylabel('True Positive Rate')
+            axes[i].set_title(f'{cls}\nAUC={auc:.3f}')
+            axes[i].set_xlim([0, 1])
+            axes[i].set_ylim([0, 1.05])
+            axes[i].grid(True, alpha=0.3)
+        else:
+            axes[i].set_title(f'{cls}\n(not in test set)')
+            axes[i].axis('off')
+    
+    for i in range(n_classes, len(axes)):
+        axes[i].axis('off')
+    
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved ROC curves to {output_path}")
+
+
+def create_excel_report(
+    metrics: dict,
+    conf_matrix: np.ndarray,
+    class_names: list,
+    test_df: pd.DataFrame,
+    y_pred: np.ndarray,
+    label_col: str,
+    output_path: str
+):
+    """Create Excel workbook with metrics, confusion matrix, and top class breakdowns."""
+    
+    test_df = test_df.copy()
+    test_df['predicted_label'] = y_pred
+    test_df['actual_label'] = test_df[label_col]
+    
+    with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+        
+        # Tab 1: Summary metrics
+        summary_data = {
+            'Metric': [
+                'F1 Score (Macro)',
+                'F1 Score (Micro)', 
+                'F1 Score (Weighted)',
+                'AUC-ROC (Macro)',
+                'Test Set Size',
+                'Number of Classes'
+            ],
+            'Value': [
+                f"{metrics['f1_macro']:.4f}",
+                f"{metrics['f1_micro']:.4f}",
+                f"{metrics['f1_weighted']:.4f}",
+                f"{metrics['auc_roc_macro']:.4f}" if not np.isnan(metrics['auc_roc_macro']) else 'N/A',
+                len(test_df),
+                len(class_names)
+            ]
+        }
+        summary_df = pd.DataFrame(summary_data)
+        
+        # Add per-class metrics
+        per_class_rows = []
+        for cls in class_names:
+            f1 = metrics['f1_per_class'].get(cls, np.nan)
+            auc = metrics['auc_roc_per_class'].get(cls, np.nan)
+            ap = metrics['avg_precision_per_class'].get(cls, np.nan)
+            per_class_rows.append({
+                'Class': cls,
+                'F1': f"{f1:.4f}" if not np.isnan(f1) else 'N/A',
+                'AUC-ROC': f"{auc:.4f}" if not np.isnan(auc) else 'N/A',
+                'Avg Precision': f"{ap:.4f}" if not np.isnan(ap) else 'N/A'
+            })
+        per_class_df = pd.DataFrame(per_class_rows)
+        
+        # Write summary with spacing
+        summary_df.to_excel(writer, sheet_name='Summary', index=False, startrow=0)
+        per_class_df.to_excel(writer, sheet_name='Summary', index=False, startrow=len(summary_df) + 3)
+        
+        # Tab 2: Full confusion matrix
+        conf_matrix_df = pd.DataFrame(
+            conf_matrix,
+            index=[f'Actual: {c}' for c in class_names],
+            columns=[f'Pred: {c}' for c in class_names]
+        )
+        conf_matrix_df.to_excel(writer, sheet_name='Confusion Matrix')
+        
+        # Tabs 3-7: Top 5 predicted classes
+        pred_counts = pd.Series(y_pred).value_counts()
+        top_5_classes = pred_counts.head(5).index.tolist()
+        
+        for i, cls in enumerate(top_5_classes):
+            # Filter to rows predicted as this class
+            class_df = test_df[test_df['predicted_label'] == cls].copy()
+            
+            # Reorder columns: actual, predicted, then rest
+            cols = ['actual_label', 'predicted_label'] + [
+                c for c in test_df.columns 
+                if c not in ['actual_label', 'predicted_label', label_col]
+            ]
+            class_df = class_df[cols]
+            
+            # Sanitize sheet name (Excel limits: 31 chars, no special chars)
+            sheet_name = str(cls)[:31].replace('/', '-').replace('\\', '-').replace('*', '').replace('?', '').replace('[', '').replace(']', '')
+            
+            class_df.to_excel(writer, sheet_name=sheet_name, index=False)
+    
+    print(f"Saved Excel report to {output_path}")
+
+
+def main():
+    # === CONFIGURE THESE ===
+    file_paths = [
+        'report_01.xlsx',
+        'report_02.xlsx',
+        'report_03.xlsx',
+        'report_04.xlsx',
+        'report_05.xlsx',
+        'report_06.xlsx',
+        'report_07.xlsx',
+        'report_08.xlsx',
+        'report_09.xlsx',
+        'report_10.xlsx',
+    ]  # Must be in chronological order
+    
+    label_col = 'label'
+    train_files = 8  # First N files for training
+    output_excel = 'evaluation_report.xlsx'
+    output_pr_curves = 'precision_recall_curves.png'
+    output_roc_curves = 'roc_curves.png'
+    # ========================
+    
+    # Validate file count
+    if len(file_paths) < train_files + 1:
+        raise ValueError(f"Need at least {train_files + 1} files, got {len(file_paths)}")
+    
+    print("Loading reports chronologically...")
+    report_dfs = load_reports_chronologically(file_paths)
+    
+    # Split chronologically
+    train_dfs = report_dfs[:train_files]
+    test_dfs = report_dfs[train_files:]
+    
+    train_df = pd.concat(train_dfs, ignore_index=True)
+    test_df = pd.concat(test_dfs, ignore_index=True)
+    
+    train_files_used = [Path(file_paths[i]).name for i in range(train_files)]
+    test_files_used = [Path(file_paths[i]).name for i in range(train_files, len(file_paths))]
+    
+    print(f"\nChronological split:")
+    print(f"  Training files ({len(train_files_used)}): {', '.join(train_files_used)}")
+    print(f"  Test files ({len(test_files_used)}):     {', '.join(test_files_used)}")
+    print(f"  Training rows: {len(train_df)}")
+    print(f"  Test rows:     {len(test_df)}")
+    
+    # Prepare features
+    print("\nPreparing features...")
+    X_train, y_train, feature_cols, encoders = prepare_features(train_df, label_col, fit=True)
+    X_test, y_test, _, _ = prepare_features(test_df, label_col, encoders=encoders, fit=False)
+    
+    # Get consistent class names from training data
+    le = LabelEncoder()
+    y_train_encoded = le.fit_transform(y_train)
+    y_test_encoded = le.transform(y_test)
+    class_names = list(le.classes_)
+    
+    print(f"  Features: {len(feature_cols)}")
+    print(f"  Classes:  {len(class_names)}")
+    
+    # Train model
+    print("\nTraining Random Forest...")
+    model = RandomForestClassifier(
+        n_estimators=200,
+        max_depth=20,
+        class_weight='balanced',
+        random_state=42,
+        n_jobs=-1
+    )
+    model.fit(X_train, y_train_encoded)
+    
+    # Predictions on test set
+    y_pred_encoded = model.predict(X_test)
+    y_proba = model.predict_proba(X_test)
+    
+    # Decode predictions back to original labels
+    y_pred = le.inverse_transform(y_pred_encoded)
+    
+    # Compute metrics
+    print("\nComputing metrics...")
+    metrics = compute_metrics(y_test_encoded, y_pred_encoded, y_proba, class_names)
+    
+    print(f"\n{'='*50}")
+    print("TEST SET METRICS")
+    print(f"{'='*50}")
+    print(f"F1 Score (Macro):    {metrics['f1_macro']:.4f}")
+    print(f"F1 Score (Micro):    {metrics['f1_micro']:.4f}")
+    print(f"F1 Score (Weighted): {metrics['f1_weighted']:.4f}")
+    print(f"AUC-ROC (Macro):     {metrics['auc_roc_macro']:.4f}")
+    
+    # Confusion matrix
+    conf_matrix = confusion_matrix(y_test_encoded, y_pred_encoded)
+    
+    # Generate plots
+    print("\nGenerating plots...")
+    plot_precision_recall_curves(y_test_encoded, y_proba, class_names, output_pr_curves)
+    plot_roc_curves(y_test_encoded, y_proba, class_names, output_roc_curves)
+    
+    # Create Excel report
+    print("\nCreating Excel report...")
+    create_excel_report(
+        metrics=metrics,
+        conf_matrix=conf_matrix,
+        class_names=class_names,
+        test_df=test_df,
+        y_pred=y_pred,
+        label_col=label_col,
+        output_path=output_excel
+    )
+    
+    print(f"\n{'='*50}")
+    print("OUTPUTS")
+    print(f"{'='*50}")
+    print(f"  {output_excel}")
+    print(f"  {output_pr_curves}")
+    print(f"  {output_roc_curves}")
+
+
+if __name__ == '__main__':
+    main()
